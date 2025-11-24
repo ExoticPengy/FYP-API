@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import simulated_db 
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 load_dotenv()
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 MODEL_FILE = "charge_model_final.pkl"
@@ -35,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATA MODELS ---
+# --- 2. DATA MODELS ---
 class TripRequest(BaseModel):
     start_lat: float
     start_lng: float
@@ -46,7 +46,7 @@ class TripRequest(BaseModel):
     battery_capacity_kwh: int = 60
     preferred_speed: str = "any"
 
-# --- MATH HELPERS ---
+# --- 3. MATH HELPERS ---
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371 
     dLat = math.radians(lat2 - lat1)
@@ -73,7 +73,16 @@ def predict_time(station, req: TripRequest):
     if power <= 0: return 999
     return round((energy_needed / power) * 60, 1)
 
-# --- GOOGLE MAPS HELPER ---
+def estimate_cost(kwh_needed, station):
+    if station['charger_type'] == 'AC':
+        rate = 1.00
+    elif station['charger_max_power'] >= 100:
+        rate = 1.60
+    else:
+        rate = 1.40
+    return round(kwh_needed * rate, 2)
+
+# --- 4. GOOGLE MAPS HELPER ---
 async def fetch_route_data(start_lat, start_lng, end_lat, end_lng, stop_lat, stop_lng):
     if GOOGLE_MAPS_API_KEY:
         try:
@@ -91,31 +100,43 @@ async def fetch_route_data(start_lat, start_lng, end_lat, end_lng, stop_lat, sto
                 
                 if data["status"] == "OK":
                     route = data["routes"][0]
+                    
+                    # Calculate totals (Leg 1 + Leg 2)
+                    total_meters = sum(leg["distance"]["value"] for leg in route["legs"])
+                    total_seconds = sum(leg["duration"]["value"] for leg in route["legs"])
+
                     return {
                         "polyline": route["overview_polyline"]["points"],
-                        "duration_min": round(sum(leg["duration"]["value"] for leg in route["legs"]) / 60, 1)
+                        "duration_min": round(total_seconds / 60, 1),
+                        "distance_km": round(total_meters / 1000, 1) # Convert meters to km
                     }
                 else:
                     print(f"⚠️ Google API Status: {data['status']}")
         except Exception as e:
             print(f"⚠️ API Connection Error: {e}")
 
+    # Fallback
     print("⚠️ Using Simulation Fallback")
     points = [(start_lat, start_lng), (stop_lat, stop_lng), (end_lat, end_lng)]
     dist_km = haversine(start_lat, start_lng, stop_lat, stop_lng) + haversine(stop_lat, stop_lng, end_lat, end_lng)
     
     return {
         "polyline": polyline.encode(points), 
-        "duration_min": round((dist_km / 80) * 60, 1)
+        "duration_min": round((dist_km / 80) * 60, 1),
+        "distance_km": round(dist_km, 1)
     }
 
-# --- MAIN API ENDPOINT ---
+# --- 5. MAIN API ENDPOINT ---
 @app.post("/recommendations")
 async def get_recommendations(req: TripRequest):
     mid_lat = (req.start_lat + req.end_lat) / 2
     mid_lng = (req.start_lng + req.end_lng) / 2
     
     candidates = []
+    
+    # Calculate Energy Needed
+    energy_needed_kwh = (req.target_soc - req.current_soc) / 100 * req.battery_capacity_kwh
+    if energy_needed_kwh < 0: energy_needed_kwh = 0
 
     for station_id, station in simulated_db.STATIONS_DB.items():
         power = station['charger_max_power']
@@ -129,6 +150,9 @@ async def get_recommendations(req: TripRequest):
             item = station.copy()
             item['detour_km'] = round(dist, 1)
             item['estimated_time_min'] = predict_time(station, req)
+            
+            item['energy_added_kwh'] = round(energy_needed_kwh, 2)
+            item['estimated_cost_myr'] = estimate_cost(energy_needed_kwh, station)
             
             score = dist + (item['estimated_time_min'] * 0.5)
             
@@ -150,6 +174,8 @@ async def get_recommendations(req: TripRequest):
     final_results = []
     trip_polyline = None
     charger_stop_info = None
+    trip_total_dist = 0
+    trip_total_time = 0
     
     for i, station in enumerate(top_5):
         station['maps_url'] = (
@@ -168,12 +194,18 @@ async def get_recommendations(req: TripRequest):
             )
             station['polyline'] = route_info['polyline']
             station['real_traffic_duration_min'] = route_info['duration_min']
+            
+            # Save top trip details for the "trip" block
             trip_polyline = route_info['polyline']
-
+            trip_total_dist = route_info['distance_km']
+            trip_total_time = route_info['duration_min']
+            
             charger_stop_info = {
                 "lat": station["latitude"],
                 "lng": station["longitude"],
-                "name": station["name"]
+                "name": station["name"],
+                "cost_est": station["estimated_cost_myr"],
+                "kwh_est": station["energy_added_kwh"]
             }
         else:
             station['polyline'] = None 
@@ -187,7 +219,9 @@ async def get_recommendations(req: TripRequest):
             "destination": {"lat": req.end_lat, "lng": req.end_lng},
             "charger_stop": charger_stop_info,
             "midpoint": {"lat": mid_lat, "lng": mid_lng},
-            "polyline": trip_polyline 
+            "polyline": trip_polyline,
+            "total_distance_km": trip_total_dist,     # <--- Added
+            "total_duration_min": trip_total_time     # <--- Added
         },
         "options": final_results
     }
