@@ -1,3 +1,4 @@
+# main.py
 import pandas as pd
 import joblib
 import math
@@ -14,6 +15,7 @@ import simulated_db
 load_dotenv()
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 MODEL_FILE = "charge_model_final.pkl"
+AVG_CONSUMPTION_KWH_KM = 0.2  # Conservative estimate (20kWh/100km)
 
 charge_model = None
 if os.path.exists(MODEL_FILE):
@@ -100,15 +102,13 @@ async def fetch_route_data(start_lat, start_lng, end_lat, end_lng, stop_lat, sto
                 
                 if data["status"] == "OK":
                     route = data["routes"][0]
-                    
-                    # Calculate totals (Leg 1 + Leg 2)
                     total_meters = sum(leg["distance"]["value"] for leg in route["legs"])
                     total_seconds = sum(leg["duration"]["value"] for leg in route["legs"])
 
                     return {
                         "polyline": route["overview_polyline"]["points"],
                         "duration_min": round(total_seconds / 60, 1),
-                        "distance_km": round(total_meters / 1000, 1) # Convert meters to km
+                        "distance_km": round(total_meters / 1000, 1)
                     }
                 else:
                     print(f"⚠️ Google API Status: {data['status']}")
@@ -134,7 +134,14 @@ async def get_recommendations(req: TripRequest):
     
     candidates = []
     
-    # Calculate Energy Needed
+    current_kwh = (req.current_soc / 100) * req.battery_capacity_kwh
+    max_range_km = current_kwh / AVG_CONSUMPTION_KWH_KM
+    
+    safe_buffer_km = (0.05 * req.battery_capacity_kwh) / AVG_CONSUMPTION_KWH_KM
+    safe_driveable_km = max_range_km - safe_buffer_km
+    
+    if safe_driveable_km < 10: safe_driveable_km = 10 
+
     energy_needed_kwh = (req.target_soc - req.current_soc) / 100 * req.battery_capacity_kwh
     if energy_needed_kwh < 0: energy_needed_kwh = 0
 
@@ -144,17 +151,23 @@ async def get_recommendations(req: TripRequest):
         if req.preferred_speed == "fast" and power < 50: continue
         if req.preferred_speed == "ultrafast" and power < 100: continue
 
-        dist = haversine(mid_lat, mid_lng, station['latitude'], station['longitude'])
+        dist_from_start = haversine(req.start_lat, req.start_lng, station['latitude'], station['longitude'])
         
-        if dist <= 100: 
+        if dist_from_start > safe_driveable_km:
+            continue
+
+        dist_from_mid = haversine(mid_lat, mid_lng, station['latitude'], station['longitude'])
+        
+        if dist_from_mid <= 100: 
             item = station.copy()
-            item['detour_km'] = round(dist, 1)
+            item['detour_km'] = round(dist_from_mid, 1)
+            item['dist_from_start'] = round(dist_from_start, 1) # Useful for debugging
             item['estimated_time_min'] = predict_time(station, req)
             
             item['energy_added_kwh'] = round(energy_needed_kwh, 2)
             item['estimated_cost_myr'] = estimate_cost(energy_needed_kwh, station)
             
-            score = dist + (item['estimated_time_min'] * 0.5)
+            score = dist_from_mid + (item['estimated_time_min'] * 0.5)
             
             if station['status'] != 'Available': 
                 score += 200
@@ -195,7 +208,6 @@ async def get_recommendations(req: TripRequest):
             station['polyline'] = route_info['polyline']
             station['real_traffic_duration_min'] = route_info['duration_min']
             
-            # Save top trip details for the "trip" block
             trip_polyline = route_info['polyline']
             trip_total_dist = route_info['distance_km']
             trip_total_time = route_info['duration_min']
@@ -220,8 +232,9 @@ async def get_recommendations(req: TripRequest):
             "charger_stop": charger_stop_info,
             "midpoint": {"lat": mid_lat, "lng": mid_lng},
             "polyline": trip_polyline,
-            "total_distance_km": trip_total_dist,     # <--- Added
-            "total_duration_min": trip_total_time     # <--- Added
+            "total_distance_km": trip_total_dist,
+            "total_duration_min": trip_total_time,
+            "max_safe_range_km": round(safe_driveable_km, 1) 
         },
         "options": final_results
     }
