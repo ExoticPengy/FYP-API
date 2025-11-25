@@ -15,7 +15,7 @@ import simulated_db
 load_dotenv()
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 MODEL_FILE = "charge_model_final.pkl"
-AVG_CONSUMPTION_KWH_KM = 0.2  # Conservative estimate (20kWh/100km)
+AVG_CONSUMPTION_KWH_KM = 0.2
 
 charge_model = None
 if os.path.exists(MODEL_FILE):
@@ -134,17 +134,17 @@ async def get_recommendations(req: TripRequest):
     
     candidates = []
     
+    # 1. Range Calculations
     current_kwh = (req.current_soc / 100) * req.battery_capacity_kwh
     max_range_km = current_kwh / AVG_CONSUMPTION_KWH_KM
-    
     safe_buffer_km = (0.05 * req.battery_capacity_kwh) / AVG_CONSUMPTION_KWH_KM
     safe_driveable_km = max_range_km - safe_buffer_km
-    
     if safe_driveable_km < 10: safe_driveable_km = 10 
-
+    
     energy_needed_kwh = (req.target_soc - req.current_soc) / 100 * req.battery_capacity_kwh
     if energy_needed_kwh < 0: energy_needed_kwh = 0
 
+    # 2. Main Loop (Standard Midpoint Strategy)
     for station_id, station in simulated_db.STATIONS_DB.items():
         power = station['charger_max_power']
         
@@ -153,34 +153,65 @@ async def get_recommendations(req: TripRequest):
 
         dist_from_start = haversine(req.start_lat, req.start_lng, station['latitude'], station['longitude'])
         
+        # Strict Range Check
         if dist_from_start > safe_driveable_km:
             continue
 
         dist_from_mid = haversine(mid_lat, mid_lng, station['latitude'], station['longitude'])
-        
         if dist_from_mid <= 100: 
             item = station.copy()
             item['detour_km'] = round(dist_from_mid, 1)
-            item['dist_from_start'] = round(dist_from_start, 1) # Useful for debugging
             item['estimated_time_min'] = predict_time(station, req)
-            
             item['energy_added_kwh'] = round(energy_needed_kwh, 2)
             item['estimated_cost_myr'] = estimate_cost(energy_needed_kwh, station)
             
             score = dist_from_mid + (item['estimated_time_min'] * 0.5)
+            if station['status'] != 'Available': score += 200
+            elif power >= 120: score -= 15
             
-            if station['status'] != 'Available': 
-                score += 200
-                item['note'] = f"⚠️ {station['status']}"
-            elif power >= 120: 
-                score -= 15
-                item['note'] = "⚡ Ultra-Fast Choice"
-            else: 
-                item['note'] = "✅ Standard Option"
-
             item['score'] = round(score, 2)
+            item['note'] = "✅ Standard Option"
             candidates.append(item)
 
+    # 3. Emergency Fallback (Reachable but ignored Speed Prefs)
+    if not candidates:
+        print("⚠️ No ideal chargers. Searching for ANY reachable charger near start...")
+        for station_id, station in simulated_db.STATIONS_DB.items():
+            dist_from_start = haversine(req.start_lat, req.start_lng, station['latitude'], station['longitude'])
+            
+            if dist_from_start <= safe_driveable_km:
+                item = station.copy()
+                item['detour_km'] = round(dist_from_start, 1)
+                item['estimated_time_min'] = predict_time(station, req)
+                item['energy_added_kwh'] = round(energy_needed_kwh, 2)
+                item['estimated_cost_myr'] = estimate_cost(energy_needed_kwh, station)
+                item['score'] = dist_from_start 
+                item['note'] = "⚠️ Emergency Stop (Reachable)"
+                candidates.append(item)
+
+    # 4. ABSOLUTE LAST RESORT (If even emergency search failed)
+    if not candidates:
+        print("⚠️ CRITICAL: No reachable chargers found. Returning absolute closest.")
+        closest_station = None
+        min_dist = float('inf')
+
+        for station_id, station in simulated_db.STATIONS_DB.items():
+            d = haversine(req.start_lat, req.start_lng, station['latitude'], station['longitude'])
+            if d < min_dist:
+                min_dist = d
+                closest_station = station
+
+        if closest_station:
+            item = closest_station.copy()
+            item['detour_km'] = round(min_dist, 1)
+            item['estimated_time_min'] = predict_time(closest_station, req)
+            item['energy_added_kwh'] = round(energy_needed_kwh, 2)
+            item['estimated_cost_myr'] = estimate_cost(energy_needed_kwh, closest_station)
+            item['score'] = min_dist
+            item['note'] = "❌ OUT OF RANGE (Closest Option)"
+            candidates.append(item)
+
+    # 5. Sort & Finalize
     candidates.sort(key=lambda x: x['score'])
     top_5 = candidates[:5]
 
@@ -207,7 +238,6 @@ async def get_recommendations(req: TripRequest):
             )
             station['polyline'] = route_info['polyline']
             station['real_traffic_duration_min'] = route_info['duration_min']
-            
             trip_polyline = route_info['polyline']
             trip_total_dist = route_info['distance_km']
             trip_total_time = route_info['duration_min']
@@ -234,7 +264,7 @@ async def get_recommendations(req: TripRequest):
             "polyline": trip_polyline,
             "total_distance_km": trip_total_dist,
             "total_duration_min": trip_total_time,
-            "max_safe_range_km": round(safe_driveable_km, 1) 
+            "max_safe_range_km": round(safe_driveable_km, 1)
         },
         "options": final_results
     }
