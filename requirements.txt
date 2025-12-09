@@ -8,3 +8,5 @@ python-dotenv
 polyline
 requests
 pydantic
+psycopg2-binary 
+sqlalchemy

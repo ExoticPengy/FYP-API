@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import simulated_db 
+import database 
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
@@ -76,12 +76,15 @@ def predict_time(station, req: TripRequest):
     return round((energy_needed / power) * 60, 1)
 
 def estimate_cost(kwh_needed, station):
-    if station['charger_type'] == 'AC':
-        rate = 1.00
-    elif station['charger_max_power'] >= 100:
-        rate = 1.60
+    if 'cost_per_kwh' in station:
+        rate = station['cost_per_kwh']
     else:
-        rate = 1.40
+        if station['charger_type'] == 'AC':
+            rate = 1.00
+        elif station['charger_max_power'] >= 100:
+            rate = 1.60
+        else:
+            rate = 1.40
     return round(kwh_needed * rate, 2)
 
 # --- 4. GOOGLE MAPS HELPER ---
@@ -144,8 +147,10 @@ async def get_recommendations(req: TripRequest):
     energy_needed_kwh = (req.target_soc - req.current_soc) / 100 * req.battery_capacity_kwh
     if energy_needed_kwh < 0: energy_needed_kwh = 0
 
+    LIVE_STATIONS_DB = database.get_live_chargers()
+
     # 2. Main Loop (Standard Midpoint Strategy)
-    for station_id, station in simulated_db.STATIONS_DB.items():
+    for station_id, station in LIVE_STATIONS_DB.items():
         power = station['charger_max_power']
         
         if req.preferred_speed == "fast" and power < 50: continue
@@ -166,8 +171,11 @@ async def get_recommendations(req: TripRequest):
             item['estimated_cost_myr'] = estimate_cost(energy_needed_kwh, station)
             
             score = dist_from_mid + (item['estimated_time_min'] * 0.5)
-            if station['status'] != 'Available': score += 200
-            elif power >= 120: score -= 15
+            
+            if station['status'] != 'Available': 
+                score += 200
+            elif power >= 120: 
+                score -= 15
             
             item['score'] = round(score, 2)
             item['note'] = "✅ Standard Option"
@@ -176,7 +184,7 @@ async def get_recommendations(req: TripRequest):
     # 3. Emergency Fallback (Reachable but ignored Speed Prefs)
     if not candidates:
         print("⚠️ No ideal chargers. Searching for ANY reachable charger near start...")
-        for station_id, station in simulated_db.STATIONS_DB.items():
+        for station_id, station in LIVE_STATIONS_DB.items():
             dist_from_start = haversine(req.start_lat, req.start_lng, station['latitude'], station['longitude'])
             
             if dist_from_start <= safe_driveable_km:
@@ -195,7 +203,7 @@ async def get_recommendations(req: TripRequest):
         closest_station = None
         min_dist = float('inf')
 
-        for station_id, station in simulated_db.STATIONS_DB.items():
+        for station_id, station in LIVE_STATIONS_DB.items():
             d = haversine(req.start_lat, req.start_lng, station['latitude'], station['longitude'])
             if d < min_dist:
                 min_dist = d
